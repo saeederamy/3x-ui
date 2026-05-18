@@ -1,0 +1,101 @@
+name: Sync Upstream Releases
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  check-and-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get latest upstream release tag
+        id: upstream
+        run: |
+          tag=$(curl -fsSL "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" \
+            | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ -z "$tag" ]; then
+            echo "Could not fetch upstream release tag" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> $GITHUB_OUTPUT
+          echo "Latest upstream tag: $tag"
+
+      - name: Check if release already exists in fork
+        id: check
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/saeederamy/3x-ui/releases/tags/$TAG")
+          if [ "$status" = "200" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Release $TAG already exists in fork — nothing to do."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "Release $TAG not found in fork — will sync."
+          fi
+
+      - name: Sync upstream and apply fork patches
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          TAG="${{ steps.upstream.outputs.tag }}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add upstream and fetch the specific tag
+          git remote add upstream https://github.com/MHSanaei/3x-ui.git
+          git fetch upstream "refs/tags/$TAG:refs/tags/upstream-$TAG" --no-tags
+
+          # Create a working branch from the upstream tag
+          git checkout -b "sync/$TAG" "upstream-$TAG"
+
+          # ── Patch 1: shell scripts — replace upstream repo refs ──────────
+          find . -maxdepth 1 -name "*.sh" -exec \
+            sed -i \
+              -e 's|MHSanaei/3x-ui|saeederamy/3x-ui|g' \
+              -e 's|mhsanaei/3x-ui|saeederamy/3x-ui|g' \
+            {} +
+
+          # ── Patch 2: fix legacy_version to use main/install.sh ──────────
+          if [ -f x-ui.sh ]; then
+            sed -i \
+              's|/3x-ui/v$tag_version/install.sh|/3x-ui/main/install.sh|g' \
+              x-ui.sh
+          fi
+
+          # ── Patch 3: go.mod module path ──────────────────────────────────
+          if [ -f go.mod ]; then
+            sed -i 's|github.com/mhsanaei/3x-ui|github.com/saeederamy/3x-ui|g' go.mod
+          fi
+
+          # ── Patch 4: all Go import paths ─────────────────────────────────
+          find . -name "*.go" -not -path "./.git/*" -exec \
+            sed -i 's|github.com/mhsanaei/3x-ui|github.com/saeederamy/3x-ui|g' {} +
+
+          # ── Keep fork's own CI workflows ─────────────────────────────────
+          git checkout origin/main -- .github/workflows/
+
+          # Commit everything
+          git add -A
+          git commit -m "chore: sync upstream $TAG + apply fork patches [skip ci]" || true
+
+          # Merge into main
+          git checkout main
+          git merge "sync/$TAG" --no-ff -m "chore: sync upstream $TAG"
+          git push origin main
+
+          # Move tag to point to our patched commit and push
+          git tag -f "$TAG"
+          git push origin "$TAG" --force
+
+          echo "✓ Synced $TAG — release.yml will now build and publish the release."
